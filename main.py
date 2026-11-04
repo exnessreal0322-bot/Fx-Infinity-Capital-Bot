@@ -1,6 +1,12 @@
+
 import os
+import json
+import uuid
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 
+import websockets
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
 from telegram.ext import (
@@ -9,12 +15,21 @@ from telegram.ext import (
     ContextTypes
 )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+logger = logging.getLogger("FxInfinity")
+
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+ALLTICK_API_TOKEN = os.environ.get("ALLTICK_API_TOKEN")
+
 PUBLIC_URL = os.environ.get(
     "RENDER_EXTERNAL_URL",
     "https://fx-infinity-capital-bot.onrender.com"
 )
+
 
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
@@ -87,6 +102,90 @@ telegram_app.add_handler(CommandHandler("weekly", weekly))
 telegram_app.add_handler(CommandHandler("risk", risk))
 
 
+async def alltick_test():
+    if not ALLTICK_API_TOKEN:
+        logger.error("AllTick API token is missing")
+        return
+
+    uri = (
+        "wss://quote.alltick.co/quote-b-ws-api?token="
+        + ALLTICK_API_TOKEN
+    )
+
+    while True:
+        try:
+            logger.info("Connecting to AllTick WebSocket...")
+
+            async with websockets.connect(uri) as socket:
+                logger.info("AllTick WebSocket connected")
+
+                subscribe = {
+                    "cmd_id": 22004,
+                    "seq_id": 1,
+                    "trace": str(uuid.uuid4()),
+                    "data": {
+                        "symbol_list": [
+                            {"code": "EURUSD"}
+                        ]
+                    }
+                }
+
+                await socket.send(json.dumps(subscribe))
+                logger.info("Test subscription sent: EURUSD")
+
+                async def heartbeat():
+                    while True:
+                        await asyncio.sleep(10)
+                        await socket.send(json.dumps({
+                            "cmd_id": 22000,
+                            "seq_id": 2,
+                            "trace": "heartbeat",
+                            "data": {}
+                        }))
+
+                heartbeat_task = asyncio.create_task(heartbeat())
+
+                try:
+                    async for message in socket:
+                        try:
+                            data = json.loads(message)
+
+                            logger.info(
+                                "AllTick response: cmd_id=%s ret=%s msg=%s",
+                                data.get("cmd_id"),
+                                data.get("ret"),
+                                data.get("msg", "")
+                            )
+
+                            if data.get("cmd_id") == 22998:
+                                logger.info(
+                                    "Market data received for symbol: %s",
+                                    data.get("data", {}).get("code", "unknown")
+                                )
+
+                        except (ValueError, AttributeError):
+                            logger.warning("Received an unrecognized message")
+
+                finally:
+                    heartbeat_task.cancel()
+                    await asyncio.gather(
+                        heartbeat_task,
+                        return_exceptions=True
+                    )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as error:
+            logger.error(
+                "AllTick connection error: %s",
+                type(error).__name__
+            )
+
+        logger.info("Retrying AllTick connection in 15 seconds")
+        await asyncio.sleep(15)
+
+
 @asynccontextmanager
 async def lifespan(api: FastAPI):
     if not BOT_TOKEN or not WEBHOOK_SECRET:
@@ -100,11 +199,19 @@ async def lifespan(api: FastAPI):
         secret_token=WEBHOOK_SECRET
     )
 
-    yield
+    alltick_task = asyncio.create_task(alltick_test())
 
-    await telegram_app.bot.delete_webhook()
-    await telegram_app.stop()
-    await telegram_app.shutdown()
+    logger.info("Fx Infinity Capital Bot started")
+
+    try:
+        yield
+    finally:
+        alltick_task.cancel()
+        await asyncio.gather(alltick_task, return_exceptions=True)
+
+        await telegram_app.bot.delete_webhook()
+        await telegram_app.stop()
+        await telegram_app.shutdown()
 
 
 api = FastAPI(lifespan=lifespan)
@@ -112,7 +219,9 @@ api = FastAPI(lifespan=lifespan)
 
 @api.get("/")
 async def home():
-    return {"status": "Fx Infinity Capital Bot is running"}
+    return {
+        "status": "Fx Infinity Capital Bot is running"
+    }
 
 
 @api.post("/telegram-webhook")
