@@ -1,7 +1,22 @@
 import os
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.request import HTTPXRequest
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes
+)
+
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+PUBLIC_URL = os.environ.get(
+    "RENDER_EXTERNAL_URL",
+    "https://fx-infinity-capital-bot.onrender.com"
+)
+
+telegram_app = Application.builder().token(BOT_TOKEN).build()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -25,8 +40,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "XAUUSD Analysis\n\n"
-        "Market data is not connected yet."
+        "XAUUSD Analysis\n\nMarket data is not connected yet."
     )
 
 
@@ -63,45 +77,63 @@ async def risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def main():
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CommandHandler("help", help_command))
+telegram_app.add_handler(CommandHandler("analysis", analysis))
+telegram_app.add_handler(CommandHandler("signal", signal))
+telegram_app.add_handler(CommandHandler("price", price))
+telegram_app.add_handler(CommandHandler("daily", daily))
+telegram_app.add_handler(CommandHandler("weekly", weekly))
+telegram_app.add_handler(CommandHandler("risk", risk))
 
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
 
-    request = HTTPXRequest(
-        connect_timeout=30,
-        read_timeout=30,
-        write_timeout=30,
-        pool_timeout=30
+@asynccontextmanager
+async def lifespan(api: FastAPI):
+    if not BOT_TOKEN or not WEBHOOK_SECRET:
+        raise RuntimeError("Bot environment variables are missing")
+
+    await telegram_app.initialize()
+    await telegram_app.start()
+
+    await telegram_app.bot.set_webhook(
+        url=f"{PUBLIC_URL}/telegram-webhook",
+        secret_token=WEBHOOK_SECRET
     )
 
-    updates_request = HTTPXRequest(
-        connect_timeout=30,
-        read_timeout=40,
-        write_timeout=30,
-        pool_timeout=30
-    )
+    yield
 
-    app = (
-        Application.builder()
-        .token(token)
-        .request(request)
-        .get_updates_request(updates_request)
-        .build()
-    )
+    await telegram_app.bot.delete_webhook()
+    await telegram_app.stop()
+    await telegram_app.shutdown()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("analysis", analysis))
-    app.add_handler(CommandHandler("signal", signal))
-    app.add_handler(CommandHandler("price", price))
-    app.add_handler(CommandHandler("daily", daily))
-    app.add_handler(CommandHandler("weekly", weekly))
-    app.add_handler(CommandHandler("risk", risk))
 
-    app.run_polling(bootstrap_retries=-1)
+api = FastAPI(lifespan=lifespan)
+
+
+@api.get("/")
+async def home():
+    return {"status": "Fx Infinity Capital Bot is running"}
+
+
+@api.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    if request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token"
+    ) != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403)
+
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+
+    return {"ok": True}
 
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+
+    uvicorn.run(
+        api,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
